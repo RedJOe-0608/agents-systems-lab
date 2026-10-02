@@ -1,0 +1,24 @@
+.DS_Store
+.env
+.venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.idea/
+.vscode/
+
+# Local agent artifacts and credentials
+.langgraph_api/
+.langsmith/
+artifacts/
+checkpoints/
+*.pem
+*.key
+
