@@ -50,6 +50,10 @@ AVAILABLE_TOOLS = {
 
 MAX_STEPS = 5
 
+# important observations:
+# one model call can request multiple tool calls.
+# Each tool call has a separate id
+
 
 def call_model(messages):
     """Send the current conversation to the model."""
