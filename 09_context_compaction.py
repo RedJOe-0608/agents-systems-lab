@@ -78,6 +78,7 @@ AVAILABLE_TOOLS = {
 
 MAX_STEPS = 5
 MAX_CONTEXT_TURNS = 3
+COMPACTION_BATCH_TURNS = 3
 
 # The user may restrict the agent’s capabilities, but cannot expand them.
 # Runtime knows:       read_file, write_file, delete_file, web_search
@@ -281,7 +282,7 @@ def compact_old_messages(
     existing_summary,
     summarized_until,
 ):
-    """Add newly evicted messages to the rolling summary."""
+    """Compact old turns when the configured batch is full."""
 
     (
         newly_evicted_messages,
@@ -294,13 +295,29 @@ def compact_old_messages(
     if not newly_evicted_messages:
         return existing_summary, summarized_until
 
+    pending_turn_count = sum(
+        1
+        for message in newly_evicted_messages
+        if message["role"] == "user"
+    )
+
+    if pending_turn_count < COMPACTION_BATCH_TURNS:
+        print(
+            "Compaction pending: "
+            f"{pending_turn_count}/"
+            f"{COMPACTION_BATCH_TURNS} old turns."
+        )
+
+        return existing_summary, summarized_until
+
     updated_summary, summary_usage = update_summary(
         existing_summary,
         newly_evicted_messages,
     )
 
     print(
-        f"Compacted {len(newly_evicted_messages)} messages."
+        f"Compacted {pending_turn_count} turns "
+        f"({len(newly_evicted_messages)} messages)."
     )
     print(f"Updated summary: {updated_summary}")
     print(
