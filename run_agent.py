@@ -1,5 +1,6 @@
 from agent_harness.compaction import compact_old_messages
-from agent_harness.runtime import run_agent_turn
+from agent_harness.runtime import RepeatedToolCallError, run_agent_turn, AgentStepLimitError
+from agent_harness.model_client import ModelRequestError
 
 MAX_STEPS = 5
 MAX_CONTEXT_TURNS = 3 # decides how many recent turns stay in the context verbatim. The older turns become eligible for compaction.
@@ -60,20 +61,30 @@ def main():
             }
         )
 
-        conversation_summary, summarized_until = compact_old_messages(
-            messages,
-            conversation_summary,
-            summarized_until,
-            max_context_turns=MAX_CONTEXT_TURNS,
-            compaction_batch_turns=COMPACTION_BATCH_TURNS,
-        )
+        try:
+            conversation_summary, summarized_until = compact_old_messages(
+                messages,
+                conversation_summary,
+                summarized_until,
+                max_context_turns=MAX_CONTEXT_TURNS,
+                compaction_batch_turns=COMPACTION_BATCH_TURNS,
+            )
 
-        final_answer, turn_usage = run_agent_turn(
-            messages,
-            conversation_summary,
-            summarized_until,
-            max_steps=MAX_STEPS,
-        )
+            final_answer, turn_usage = run_agent_turn(
+                messages,
+                conversation_summary,
+                summarized_until,
+                max_steps=MAX_STEPS,
+            )
+        except ModelRequestError as error:
+            print(f"\nModel request failed: {error}")
+            continue
+        except AgentStepLimitError as error:
+            print(f"\nAgent stopped: {error}")
+            continue
+        except RepeatedToolCallError as error:
+            print(f"\nAgent stopped: {error}")
+            continue
 
         print(f"\nAssistant: {final_answer}")
         print(f"[Messages stored in conversation: {len(messages)}]")
