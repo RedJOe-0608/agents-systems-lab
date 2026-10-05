@@ -1,4 +1,5 @@
 from agent_harness.compaction import compact_old_messages
+from agent_harness.memory_extraction import extract_session_candidates
 from agent_harness.runtime import RepeatedToolCallError, run_agent_turn, AgentStepLimitError
 from agent_harness.model_client import ModelRequestError
 from agent_harness.db import create_session, save_message, end_session
@@ -55,6 +56,11 @@ def main():
 
         if user_message.lower() in {"quit", "exit"}:
             end_session(session_id)
+            try:
+                candidates = extract_session_candidates(session_id)
+                print(f"Memory candidates: {candidates}")
+            except (ModelRequestError, ValueError) as error:
+                print(f"Memory extraction failed: {error}")
             print("Goodbye!")
             break
 
