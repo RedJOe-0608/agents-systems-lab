@@ -1,6 +1,7 @@
 from agent_harness.compaction import compact_old_messages
 from agent_harness.runtime import RepeatedToolCallError, run_agent_turn, AgentStepLimitError
 from agent_harness.model_client import ModelRequestError
+from agent_harness.db import create_session, save_message, end_session
 
 MAX_STEPS = 5
 MAX_CONTEXT_TURNS = 3 # decides how many recent turns stay in the context verbatim. The older turns become eligible for compaction.
@@ -30,6 +31,10 @@ a capability or information you do not have.
 
 
 def main():
+
+    # create a new session each time CLI starts.
+    session_id = create_session()
+
     # Conversation state starts empty.
     messages = [
         {
@@ -37,6 +42,8 @@ def main():
             "content": SYSTEM_PROMPT,
         }
     ]
+
+    save_message(session_id, 0, messages[0])
 
     conversation_summary = ""
     summarized_until = 1  # summarization should start after the system prompt.
@@ -47,6 +54,7 @@ def main():
         user_message = input("\nYou: ").strip()
 
         if user_message.lower() in {"quit", "exit"}:
+            end_session(session_id)
             print("Goodbye!")
             break
 
@@ -60,6 +68,9 @@ def main():
                 "content": user_message,
             }
         )
+
+        save_message(session_id, len(messages) - 1, messages[-1])
+        first_unsaved = len(messages)
 
         try:
             conversation_summary, summarized_until = compact_old_messages(
@@ -85,6 +96,9 @@ def main():
         except RepeatedToolCallError as error:
             print(f"\nAgent stopped: {error}")
             continue
+        finally:
+            for sequence_no in range(first_unsaved, len(messages)):
+                save_message(session_id, sequence_no, messages[sequence_no])
 
         print(f"\nAssistant: {final_answer}")
         print(f"[Messages stored in conversation: {len(messages)}]")
