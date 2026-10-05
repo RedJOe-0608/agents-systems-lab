@@ -33,7 +33,32 @@ def parse_extraction(raw_response: str, session_rows) -> list[dict]:
         if type(source_id) is not int or source_id not in allowed_ids:
             raise ValueError("Memory source must be a supplied message ID")
 
-        candidates.append({"text": text.strip(), "source_message_id": source_id})
+        entities = item.get("entities")
+        if not isinstance(entities, list):
+            raise ValueError("Memory entities must be a list")
+
+        clean_entities = []
+        for entity in entities:
+            if not isinstance(entity, dict):
+                raise ValueError("Each entity must be an object")
+
+            name = entity.get("name")
+            context = entity.get("context")
+            if not isinstance(name, str) or not name.strip():
+                raise ValueError("Entity name must be non-empty")
+            if not isinstance(context, str) or not context.strip():
+                raise ValueError("Entity context must be non-empty")
+
+            clean_entities.append({
+                "name": name.strip(),
+                "context": context.strip(),
+            })
+
+        candidates.append({
+            "text": text.strip(),
+            "source_message_id": source_id,
+            "entities": clean_entities,
+        })
 
     return candidates
 
@@ -42,12 +67,32 @@ Extract durable facts that could help in future conversations.
 
 Include user goals, preferences, ongoing projects, and decisions the user made.
 Write each fact as one self-contained sentence.
-For each fact, give the ID of a message that directly supports it.
+For each fact, give the ID of one message that directly supports it.
 Use only message IDs supplied in the conversation.
 Skip guesses, temporary requests, and secrets.
 
-Return only JSON in this shape:
-{"memories": [{"text": "The user is building a long-term memory project.", "source_message_id": 123}]}
+For each memory, list entities central to that fact and explicitly mentioned
+in its source message. An entity may be a person, animal, food, place,
+organization, project, tool, or other referent. Do not list every incidental
+noun. Use the name as it appears in the source message and add a short context
+explaining what it refers to. Do not invent entities or resolve aliases.
+Use an empty entities list when none qualify.
+
+Return only valid JSON, with no Markdown, in this shape:
+{
+  "memories": [
+    {
+      "text": "The user is building a memory system inspired by Jev-Mem.",
+      "source_message_id": 123,
+      "entities": [
+        {
+          "name": "Jev-Mem",
+          "context": "The memory system inspiring the user's project."
+        }
+      ]
+    }
+  ]
+}
 
 If there are no useful facts, return {"memories": []}.
 """.strip()
