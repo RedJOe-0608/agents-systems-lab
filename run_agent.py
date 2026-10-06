@@ -2,7 +2,7 @@ from agent_harness.compaction import compact_old_messages
 from agent_harness.memory_extraction import extract_session_candidates
 from agent_harness.runtime import RepeatedToolCallError, run_agent_turn, AgentStepLimitError
 from agent_harness.model_client import ModelRequestError
-from agent_harness.db import create_session, save_memory, save_message, end_session
+from agent_harness.db import create_session, find_write_candidates, save_memory, save_message, end_session
 from agent_harness.embedding_client import embed_text
 
 MAX_STEPS = 5
@@ -61,6 +61,17 @@ def main():
                 candidates = extract_session_candidates(session_id)
                 for candidate in candidates:
                     embedding = embed_text(candidate["text"])
+
+                    print(f"\nFinding candidates for: {candidate['text']}")
+                    write_candidates = find_write_candidates(
+                        candidate["text"],
+                        candidate["entities"],
+                        embedding,
+                    )
+
+                    for existing, score in write_candidates:
+                        print(f"  Candidate {existing[0]} ({score:.3f}): {existing[1]}")
+
                     memory_id = save_memory(
                         candidate["text"],
                         candidate["source_message_id"],

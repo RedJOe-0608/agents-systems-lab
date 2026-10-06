@@ -1,8 +1,10 @@
+import re
 import psycopg
 from psycopg.types.json import Jsonb
 from agent_harness.config import DATABASE_URL
 from pgvector.psycopg import register_vector
 from pgvector import HalfVector
+from rank_bm25 import BM25Okapi
 
 
 def connect_db():
@@ -77,7 +79,7 @@ def load_memories_with_sources():
             """
         ).fetchall()
 
-def search_vector_candidates(embedding: list[float], exclude_memory_id: int, limit: int = 10):
+def search_vector_candidates(embedding: list[float], limit: int = 30):
     query_vector = HalfVector(embedding)
 
     with connect_db() as conn:
@@ -88,10 +90,140 @@ def search_vector_candidates(embedding: list[float], exclude_memory_id: int, lim
                    1 - (m.embedding <=> %s) AS similarity
             FROM memories AS m
             JOIN messages AS msg ON msg.id = m.source_message_id
-            WHERE m.id <> %s
-              AND m.embedding IS NOT NULL
+            WHERE m.embedding IS NOT NULL
             ORDER BY m.embedding <=> %s
             LIMIT %s
             """,
-            (query_vector, exclude_memory_id, query_vector, limit),
+            (query_vector, query_vector, limit),
         ).fetchall()
+
+def find_entity_candidate_ids(entities: list[dict]) -> list[int]:
+    names = normalized_entity_names(entities)
+    if not names:
+        return []
+
+    with connect_db() as conn:
+        rows = conn.execute(
+            "SELECT id, entities FROM memories"
+        ).fetchall()
+
+    return [
+        memory_id
+        for memory_id, stored_entities in rows
+        if names & normalized_entity_names(stored_entities)
+    ]
+
+def load_candidates_by_ids(
+    candidate_ids: set[int], embedding: list[float]
+):
+    if not candidate_ids:
+        return []
+
+    query_vector = HalfVector(embedding)
+
+    with connect_db() as conn:
+        return conn.execute(
+            """
+            SELECT m.id, m.text, m.entities, m.source_message_id,
+                   msg.role, msg.payload,
+                   CASE
+                       WHEN m.embedding IS NULL THEN 0.0
+                       ELSE 1 - (m.embedding <=> %s)
+                   END AS similarity
+            FROM memories AS m
+            JOIN messages AS msg ON msg.id = m.source_message_id
+            WHERE m.id = ANY(%s)
+            ORDER BY m.id
+            """,
+            (query_vector, sorted(candidate_ids)),
+        ).fetchall()
+
+def tokenize_memory(text: str) -> list[str]:
+    return re.findall(r"\w+", text.casefold())
+
+MEMORY_STOPWORDS = {
+    "a", "an", "and", "are", "as", "at", "be", "by", "for",
+    "from", "in", "is", "it", "of", "on", "or", "that",
+    "the", "this", "to", "was", "were", "with", "user",
+}
+
+# This is for jaccard = number of shared words ÷ number of distinct words across both texts
+def word_overlap(first: str, second: str) -> float:
+    first_words = set(tokenize_memory(first)) - MEMORY_STOPWORDS
+    second_words = set(tokenize_memory(second)) - MEMORY_STOPWORDS
+    all_words = first_words | second_words
+
+    if not all_words:
+        return 0.0
+
+    return len(first_words & second_words) / len(all_words)
+
+def normalized_entity_names(entities: list[dict]) -> set[str]:
+    return {
+        " ".join(entity["name"].casefold().split())
+        for entity in entities
+    }
+
+def rank_write_candidates(
+    new_text: str,
+    new_entities: list[dict],
+    candidates: list[tuple],
+    limit: int = 10,
+):
+    new_names = normalized_entity_names(new_entities)
+    ranked = []
+
+    for row in candidates:
+        stored_names = normalized_entity_names(row[2])
+        entity_overlap = (
+            len(new_names & stored_names) / len(new_names)
+            if new_names else 0.0
+        )
+        similarity = max(0.0, min(1.0, float(row[6])))
+        overlap = word_overlap(new_text, row[1])
+
+        score = (
+            0.70 * similarity
+            + 0.20 * entity_overlap
+            + 0.10 * overlap
+        )
+        ranked.append((row, score))
+
+    ranked.sort(key=lambda item: (-item[1], item[0][0]))
+    return ranked[:limit]
+
+def find_write_candidates(
+    text: str,
+    entities: list[dict],
+    embedding: list[float],
+    limit: int = 10,
+):
+    candidate_ids = {
+        row[0] for row in search_vector_candidates(embedding)
+    }
+    candidate_ids.update(find_entity_candidate_ids(entities))
+
+    rows = load_candidates_by_ids(candidate_ids, embedding)
+    return rank_write_candidates(text, entities, rows, limit)
+
+def search_bm25_candidates(
+    text: str, exclude_memory_id: int, limit: int = 10
+):
+    rows = [
+        row for row in load_memories_with_sources()
+        if row[0] != exclude_memory_id
+    ]
+    query_tokens = sorted(set(tokenize_memory(text)))
+    documents = [tokenize_memory(row[1]) for row in rows]
+
+    if not query_tokens or not any(documents):
+        return []
+
+    scores = BM25Okapi(documents).get_scores(query_tokens)
+    matches = [
+        (row, float(score))
+        for row, tokens, score in zip(rows, documents, scores)
+        if not set(tokens).isdisjoint(query_tokens)
+    ]
+    matches.sort(key=lambda match: (-match[1], -match[0][0]))
+    return matches[:limit]
