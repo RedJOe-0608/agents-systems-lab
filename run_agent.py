@@ -2,8 +2,16 @@ from agent_harness.compaction import compact_old_messages
 from agent_harness.memory_extraction import extract_session_candidates
 from agent_harness.runtime import RepeatedToolCallError, run_agent_turn, AgentStepLimitError
 from agent_harness.model_client import ModelRequestError
-from agent_harness.db import create_session, find_write_candidates, save_memory, save_message, end_session
+from agent_harness.db import (
+    create_session,
+    end_session,
+    find_write_candidates,
+    save_memory,
+    save_memory_edges,
+    save_message,
+)
 from agent_harness.embedding_client import embed_text
+from agent_harness.jev_client import build_relation_edges, evaluate_memory_relations
 
 MAX_STEPS = 5
 MAX_CONTEXT_TURNS = 3 # decides how many recent turns stay in the context verbatim. The older turns become eligible for compaction.
@@ -75,11 +83,36 @@ def main():
                     memory_id = save_memory(
                         candidate["text"],
                         candidate["source_message_id"],
-                         candidate["entities"],
-                         embedding
+                        candidate["entities"],
+                        embedding,
                     )
 
                     print(f"Saved memory {memory_id}: {candidate['text']}")
+
+                    relation_decisions = evaluate_memory_relations(
+                        candidate["text"],
+                        candidate["entities"],
+                        write_candidates,
+                    )
+
+                    print("Jev relation decisions:")
+
+                    for decision in relation_decisions:
+                        print(
+                            f"  Existing memory {decision['existing_memory_id']}: "
+                            f"semantic={decision['semantic']:.3f}, "
+                            f"causes={decision['causes']:.3f}, "
+                            f"caused_by={decision['caused_by']:.3f}, "
+                            f"shared_entity={decision['shared_entity']:.3f}"
+                        )
+
+                    edges = build_relation_edges(
+                        memory_id,
+                        relation_decisions,
+                    )
+                    edge_ids = save_memory_edges(edges)
+
+                    print(f"Saved {len(edge_ids)} edges for memory {memory_id}")
 
             except (ModelRequestError, ValueError) as error:
                 print(f"Memory extraction failed: {error}")

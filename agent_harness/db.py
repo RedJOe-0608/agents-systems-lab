@@ -227,3 +227,44 @@ def search_bm25_candidates(
     ]
     matches.sort(key=lambda match: (-match[1], -match[0][0]))
     return matches[:limit]
+
+def save_memory_edges(edges: list[dict]) -> list[int]:
+    if not edges:
+        return []
+
+    edge_ids = []
+
+    with connect_db() as conn:
+        for edge in edges:
+            row = conn.execute(
+                """
+                INSERT INTO memory_edges (
+                    source_memory_id,
+                    target_memory_id,
+                    relation_type,
+                    score
+                )
+                VALUES (%s, %s, %s, %s)
+                ON CONFLICT (
+                    source_memory_id,
+                    target_memory_id,
+                    relation_type
+                )
+                DO UPDATE SET
+                    score = GREATEST(
+                        memory_edges.score,
+                        EXCLUDED.score
+                    )
+                RETURNING id
+                """,
+                (
+                    edge["source_memory_id"],
+                    edge["target_memory_id"],
+                    edge["relation_type"],
+                    edge["score"],
+                ),
+            ).fetchone()
+
+            edge_ids.append(row[0])
+
+    return edge_ids
