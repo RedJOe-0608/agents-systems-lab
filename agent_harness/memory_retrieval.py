@@ -1,5 +1,6 @@
 from agent_harness.db import (
     find_query_anchors,
+    load_active_contradiction_counterparts,
     load_graph_neighbors,
     select_graph_expansion_candidates,
 )
@@ -12,6 +13,25 @@ from agent_harness.jev_client import (
     evaluate_evidence_sufficiency,
     is_evidence_sufficient,
 )
+
+
+def add_contradiction_counterparts(
+    evidence_rows: list[tuple],
+    selected_ids: set[int],
+    visited_ids: set[int],
+) -> list[tuple]:
+    counterpart_rows = load_active_contradiction_counterparts(
+        selected_ids
+    )
+    new_rows = [
+        row
+        for row in counterpart_rows
+        if row[0] not in visited_ids
+    ]
+
+    evidence_rows.extend(new_rows)
+    visited_ids.update(row[0] for row in new_rows)
+    return new_rows
 
 
 def retrieve_memory_evidence(
@@ -62,9 +82,15 @@ def retrieve_memory_evidence(
         retrieval["stop_reason"] = "no_anchors"
         return retrieval
 
+    add_contradiction_counterparts(
+        retrieval["evidence"],
+        anchor_ids,
+        retrieval["visited_ids"],
+    )
+
     assessment = evaluate_evidence_sufficiency(
         query,
-        anchors,
+        retrieval["evidence"],
         depth=0,
     )
 
@@ -125,6 +151,12 @@ def retrieve_memory_evidence(
 
         retrieval["visited_ids"].update(
             selected_ids
+        )
+
+        add_contradiction_counterparts(
+            retrieval["evidence"],
+            selected_ids,
+            retrieval["visited_ids"],
         )
 
         retrieval["frontier_ids"] = selected_ids
