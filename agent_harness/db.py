@@ -103,6 +103,22 @@ def load_consolidation_seeds(
             (decision_version, batch_limit),
         ).fetchall()
 
+def count_pending_consolidation_seeds(
+    decision_version: str,
+) -> int:
+    with connect_db() as conn:
+        row = conn.execute(
+            """
+            SELECT count(*)
+            FROM memories
+            WHERE status = 'ACTIVE'
+              AND last_consolidated_version
+                  IS DISTINCT FROM %s
+            """,
+            (decision_version,),
+        ).fetchone()
+        return row[0]
+
 def search_vector_candidates(
     embedding: list[float],
     limit: int = 30,
@@ -769,6 +785,11 @@ def finish_consolidation_run(
 def fail_consolidation_run(
     run_id: int,
     error_message: str,
+    *,
+    seed_count: int = 0,
+    proposed_pair_count: int = 0,
+    evaluated_pair_count: int = 0,
+    applied_action_count: int = 0,
 ) -> None:
     with connect_db() as conn:
         conn.execute(
@@ -776,10 +797,21 @@ def fail_consolidation_run(
             UPDATE memory_consolidation_runs
             SET status = 'FAILED',
                 completed_at = now(),
+                seed_count = %s,
+                proposed_pair_count = %s,
+                evaluated_pair_count = %s,
+                applied_action_count = %s,
                 error_message = %s
             WHERE id = %s
             """,
-            (error_message, run_id),
+            (
+                seed_count,
+                proposed_pair_count,
+                evaluated_pair_count,
+                applied_action_count,
+                error_message,
+                run_id,
+            ),
         )
         conn.execute(
             """

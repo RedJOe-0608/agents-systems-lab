@@ -7,12 +7,23 @@ from psycopg.types.json import Jsonb
 from agent_harness.config import API_KEY, BASE_URL, MODEL_ID
 from agent_harness.db import (
     connect_db,
+    count_pending_consolidation_seeds,
+    create_consolidation_run,
+    fail_consolidation_run,
     find_consolidation_candidates,
     find_write_candidates,
+    finish_consolidation_run,
+    load_consolidation_seeds,
+    load_evaluated_pair_keys,
+    load_pending_consolidation_decisions,
+    mark_consolidation_seeds_processed,
+    record_consolidation_run_seeds,
+    save_consolidation_decisions,
 )
 from agent_harness.embedding_client import embed_text
 from agent_harness.jev_client import (
     build_relation_edges,
+    evaluate_consolidation_pairs,
     evaluate_memory_relations,
 )
 from agent_harness.model_client import request_chat_completion
@@ -21,6 +32,7 @@ from agent_harness.model_client import request_chat_completion
 CONSOLIDATION_DECISION_VERSION = "v1"
 CONSOLIDATION_MODEL_ID = "jev-latest"
 CONSOLIDATION_THRESHOLD = 0.85
+CONSOLIDATION_EVALUATION_BATCH_SIZE = 10
 
 MERGE_SYSTEM_PROMPT = """
 Combine the supplied memories into one self-contained durable fact.
@@ -716,7 +728,7 @@ def merge_memory_entities(memories: list[dict]) -> list[dict]:
 def prepare_merge(
     decision_id: int,
     candidate_limit: int = 10,
-) -> dict:
+) -> dict | None:
     decision = _load_decision_snapshot(decision_id)
 
     if decision["applied_action"] != "PENDING":
@@ -732,7 +744,7 @@ def prepare_merge(
     memories = _load_pair_memory_snapshots(decision)
 
     if any(memory["status"] != "ACTIVE" for memory in memories):
-        raise ValueError("Merge sources must both still be active")
+        return None
 
     merged_text = generate_merged_memory_text(memories)
     merged_entities = merge_memory_entities(memories)
@@ -910,7 +922,180 @@ def apply_consolidation_decision(
         )
         return apply_merge_decision(
             decision["id"],
-            prepared_merge,
+            prepared_merge or {},
         )
 
     return apply_non_merge_decision(decision["id"])
+
+
+def _chunks(items: list, chunk_size: int):
+    for start in range(0, len(items), chunk_size):
+        yield items[start:start + chunk_size]
+
+
+def run_consolidation_batch(
+    *,
+    batch_limit: int = 20,
+    candidate_limit: int = 10,
+    decision_version: str = CONSOLIDATION_DECISION_VERSION,
+    evaluation_batch_size: int = (
+        CONSOLIDATION_EVALUATION_BATCH_SIZE
+    ),
+    apply_actions: bool = True,
+) -> dict:
+    for name, value in (
+        ("batch_limit", batch_limit),
+        ("candidate_limit", candidate_limit),
+        ("evaluation_batch_size", evaluation_batch_size),
+    ):
+        if type(value) is not int or value <= 0:
+            raise ValueError(f"{name} must be a positive integer")
+
+    if not isinstance(decision_version, str) or not decision_version:
+        raise ValueError("decision_version must be non-empty text")
+
+    run_id = create_consolidation_run(
+        decision_version,
+        batch_limit,
+        candidate_limit,
+    )
+    seed_count = 0
+    proposed_pair_count = 0
+    evaluated_pair_count = 0
+    applied_action_count = 0
+
+    try:
+        seeds = load_consolidation_seeds(
+            decision_version,
+            batch_limit,
+        )
+        seed_ids = [seed[0] for seed in seeds]
+        seed_count = len(seeds)
+        record_consolidation_run_seeds(run_id, seed_ids)
+
+        evaluated_pair_keys = load_evaluated_pair_keys(
+            decision_version
+        )
+        pairs = discover_consolidation_pairs(
+            seeds,
+            candidate_limit,
+            evaluated_pair_keys,
+        )
+        proposed_pair_count = len(pairs)
+
+        for pair_batch in _chunks(
+            pairs,
+            evaluation_batch_size,
+        ):
+            decisions = evaluate_consolidation_pairs(pair_batch)
+            decision_ids = save_consolidation_decisions(
+                run_id,
+                decision_version,
+                CONSOLIDATION_MODEL_ID,
+                decisions,
+            )
+            evaluated_pair_count += len(decision_ids)
+
+        action_results = []
+        action_failures = []
+
+        if apply_actions:
+            pending_decisions = (
+                load_pending_consolidation_decisions(
+                    decision_version
+                )
+            )
+
+            for decision in pending_decisions:
+                try:
+                    result = apply_consolidation_decision(
+                        decision,
+                        candidate_limit=candidate_limit,
+                    )
+                    action_results.append(result)
+
+                    if result["action"] not in {
+                        "NONE",
+                        "DEFERRED",
+                    }:
+                        applied_action_count += 1
+                except Exception as error:
+                    record_consolidation_decision_error(
+                        decision["id"],
+                        error,
+                    )
+                    action_failures.append({
+                        "decision_id": decision["id"],
+                        "error": str(error),
+                    })
+
+        if action_failures:
+            error_message = (
+                f"{len(action_failures)} consolidation action(s) "
+                "remain pending"
+            )
+            fail_consolidation_run(
+                run_id,
+                error_message,
+                seed_count=seed_count,
+                proposed_pair_count=proposed_pair_count,
+                evaluated_pair_count=evaluated_pair_count,
+                applied_action_count=applied_action_count,
+            )
+            return {
+                "run_id": run_id,
+                "status": "FAILED",
+                "decision_version": decision_version,
+                "seed_count": seed_count,
+                "proposed_pair_count": proposed_pair_count,
+                "evaluated_pair_count": evaluated_pair_count,
+                "applied_action_count": applied_action_count,
+                "action_results": action_results,
+                "action_failures": action_failures,
+                "remaining_seed_count": (
+                    count_pending_consolidation_seeds(
+                        decision_version
+                    )
+                ),
+            }
+
+        mark_consolidation_seeds_processed(
+            run_id,
+            seed_ids,
+            decision_version,
+        )
+        finish_consolidation_run(
+            run_id,
+            seed_count=seed_count,
+            proposed_pair_count=proposed_pair_count,
+            evaluated_pair_count=evaluated_pair_count,
+            applied_action_count=applied_action_count,
+        )
+
+        return {
+            "run_id": run_id,
+            "status": "COMPLETED",
+            "decision_version": decision_version,
+            "seed_count": seed_count,
+            "proposed_pair_count": proposed_pair_count,
+            "evaluated_pair_count": evaluated_pair_count,
+            "applied_action_count": applied_action_count,
+            "action_results": action_results,
+            "action_failures": [],
+            "remaining_seed_count": (
+                count_pending_consolidation_seeds(
+                    decision_version
+                )
+            ),
+        }
+
+    except Exception as error:
+        fail_consolidation_run(
+            run_id,
+            str(error),
+            seed_count=seed_count,
+            proposed_pair_count=proposed_pair_count,
+            evaluated_pair_count=evaluated_pair_count,
+            applied_action_count=applied_action_count,
+        )
+        raise

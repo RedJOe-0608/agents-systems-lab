@@ -1,7 +1,9 @@
 import unittest
+from unittest.mock import patch
 
 from psycopg.types.json import Jsonb
 
+import agent_harness.memory_consolidation as consolidation
 from agent_harness.db import connect_db
 from agent_harness.memory_consolidation import (
     _deactivate_memory,
@@ -89,6 +91,76 @@ class ConsolidationPolicyTests(unittest.TestCase):
             merge_memory_entities(memories),
             [{"name": "PostgreSQL", "context": "Database"}],
         )
+
+
+class ConsolidationBatchTests(unittest.TestCase):
+    def test_decide_only_batch_persists_and_marks_seed(self):
+        seed = (1, "seed", [], None, None)
+        pair = (seed, (2, "candidate", [], None, None))
+        decision = {"current_memory_id": 1}
+
+        with (
+            patch.object(
+                consolidation,
+                "create_consolidation_run",
+                return_value=42,
+            ),
+            patch.object(
+                consolidation,
+                "load_consolidation_seeds",
+                return_value=[seed],
+            ),
+            patch.object(
+                consolidation,
+                "record_consolidation_run_seeds",
+            ) as record_seeds,
+            patch.object(
+                consolidation,
+                "load_evaluated_pair_keys",
+                return_value=set(),
+            ),
+            patch.object(
+                consolidation,
+                "discover_consolidation_pairs",
+                return_value=[pair],
+            ),
+            patch.object(
+                consolidation,
+                "evaluate_consolidation_pairs",
+                return_value=[decision],
+            ),
+            patch.object(
+                consolidation,
+                "save_consolidation_decisions",
+                return_value=[7],
+            ) as save_decisions,
+            patch.object(
+                consolidation,
+                "mark_consolidation_seeds_processed",
+            ) as mark_processed,
+            patch.object(
+                consolidation,
+                "finish_consolidation_run",
+            ) as finish_run,
+            patch.object(
+                consolidation,
+                "count_pending_consolidation_seeds",
+                return_value=0,
+            ),
+        ):
+            report = consolidation.run_consolidation_batch(
+                batch_limit=1,
+                candidate_limit=1,
+                apply_actions=False,
+            )
+
+        self.assertEqual(report["status"], "COMPLETED")
+        self.assertEqual(report["evaluated_pair_count"], 1)
+        self.assertEqual(report["remaining_seed_count"], 0)
+        record_seeds.assert_called_once_with(42, [1])
+        save_decisions.assert_called_once()
+        mark_processed.assert_called_once_with(42, [1], "v1")
+        finish_run.assert_called_once()
 
 
 class ReplacementTransactionTests(unittest.TestCase):
