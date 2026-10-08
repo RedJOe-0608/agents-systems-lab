@@ -4,7 +4,6 @@ from unittest.mock import patch
 from psycopg.types.json import Jsonb
 
 import agent_harness.memory_consolidation as consolidation
-from agent_harness.db import connect_db
 from agent_harness.memory_consolidation import (
     _deactivate_memory,
     apply_merge_decision,
@@ -12,6 +11,7 @@ from agent_harness.memory_consolidation import (
     merge_memory_entities,
     parse_merged_memory_text,
 )
+from agent_harness.storage.connection import connect_db
 
 
 class ConsolidationPolicyTests(unittest.TestCase):

@@ -5,13 +5,12 @@ from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
 from agent_harness.config import API_KEY, BASE_URL, MODEL_ID
-from agent_harness.db import (
-    connect_db,
+from agent_harness.storage.connection import connect_db
+from agent_harness.storage.consolidation import (
     count_pending_consolidation_seeds,
     create_consolidation_run,
     fail_consolidation_run,
     find_consolidation_candidates,
-    find_write_candidates,
     finish_consolidation_run,
     load_consolidation_seeds,
     load_evaluated_pair_keys,
@@ -20,6 +19,7 @@ from agent_harness.db import (
     record_consolidation_run_seeds,
     save_consolidation_decisions,
 )
+from agent_harness.storage.memories import find_write_candidates
 from agent_harness.embedding_client import embed_text
 from agent_harness.jev_client import (
     build_relation_edges,

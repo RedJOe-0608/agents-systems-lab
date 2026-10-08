@@ -1,6 +1,8 @@
-from agent_harness.db import (
-    find_query_anchors,
+from agent_harness.storage.consolidation import (
     load_active_contradiction_counterparts,
+)
+from agent_harness.storage.memories import (
+    find_query_anchors,
     load_graph_neighbors,
     select_graph_expansion_candidates,
 )

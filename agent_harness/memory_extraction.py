@@ -1,7 +1,9 @@
 import json
 from agent_harness.config import API_KEY, BASE_URL, MODEL_ID
-from agent_harness.db import load_session_messages
 from agent_harness.model_client import request_chat_completion
+from agent_harness.storage.conversations import (
+    load_session_messages,
+)
 
 def parse_extraction(raw_response: str, session_rows) -> list[dict]:
     try:
