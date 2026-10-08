@@ -5,11 +5,13 @@ from psycopg.types.json import Jsonb
 
 import agent_harness.memory_consolidation as consolidation
 from agent_harness.memory_consolidation import (
+    merge_memory_entities,
+    parse_merged_memory_text,
+)
+from agent_harness.memory_lifecycle import (
     _deactivate_memory,
     apply_merge_decision,
     choose_consolidation_action,
-    merge_memory_entities,
-    parse_merged_memory_text,
 )
 from agent_harness.storage.connection import connect_db
 

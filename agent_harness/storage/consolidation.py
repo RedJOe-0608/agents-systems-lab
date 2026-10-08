@@ -261,6 +261,73 @@ def load_pending_consolidation_decisions(
             return cursor.fetchall()
 
 
+def load_consolidation_decision(decision_id: int) -> dict:
+    with connect_db() as conn:
+        with conn.cursor(row_factory=dict_row) as cursor:
+            cursor.execute(
+                """
+                SELECT *
+                FROM memory_consolidation_decisions
+                WHERE id = %s
+                """,
+                (decision_id,),
+            )
+            decision = cursor.fetchone()
+
+    if decision is None:
+        raise ValueError(
+            f"Consolidation decision {decision_id} does not exist"
+        )
+
+    return decision
+
+
+def load_pair_memory_snapshots(decision: dict) -> list[dict]:
+    with connect_db() as conn:
+        with conn.cursor(row_factory=dict_row) as cursor:
+            cursor.execute(
+                """
+                SELECT
+                    id,
+                    text,
+                    entities,
+                    status,
+                    created_at
+                FROM memories
+                WHERE id = ANY(%s)
+                ORDER BY id
+                """,
+                ([
+                    decision["memory_a_id"],
+                    decision["memory_b_id"],
+                ],),
+            )
+            memories = cursor.fetchall()
+
+    if len(memories) != 2:
+        raise ValueError(
+            f"Decision {decision['id']} does not reference two memories"
+        )
+
+    return memories
+
+
+def record_consolidation_decision_error(
+    decision_id: int,
+    error: Exception,
+) -> None:
+    with connect_db() as conn:
+        conn.execute(
+            """
+            UPDATE memory_consolidation_decisions
+            SET action_error = %s
+            WHERE id = %s
+              AND applied_action = 'PENDING'
+            """,
+            (str(error), decision_id),
+        )
+
+
 def mark_consolidation_seeds_processed(
     run_id: int,
     memory_ids: list[int],
