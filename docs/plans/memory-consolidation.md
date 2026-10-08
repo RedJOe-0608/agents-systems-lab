@@ -1,9 +1,21 @@
 # Memory Consolidation Plan
 
-Status: design proposal, not implemented  
+Status: core implementation complete
 Last updated: 2026-10-08
 
-This document defines the planned consolidation subsystem for the current PostgreSQL memory implementation. It is intended to be sufficient for another coding agent to understand the decisions already made, the schema changes required, and the order in which to implement them.
+This document records the design and the implemented consolidation subsystem
+for the current PostgreSQL memory implementation. Production scheduling,
+calibrated thresholds, and cost/token budgeting remain deferred.
+
+The implementation is split across:
+
+- migrations `012` through `016` for lifecycle, origin, active indexes,
+  scheduling progress, run records, pair decisions, and lifecycle edges;
+- `agent_harness/memory_consolidation.py` for policy, transactional actions,
+  generated merges, and batch orchestration;
+- `agent_harness/db.py` for persistence and active-memory queries;
+- `agent_harness/memory_retrieval.py` for contradiction counterpart retrieval;
+- `run_memory_consolidation.py` for manual invocation.
 
 ## 1. Current memory system
 
@@ -31,13 +43,17 @@ query
   -> ephemeral memory context for the answering model
 ```
 
-Relevant existing tables:
+Relevant tables:
 
-- `memories`: one row per extracted memory, one required `source_message_id`, entities JSONB, and an optional `halfvec(2048)` embedding.
+- `memories`: one row per extracted or generated memory, a nullable direct
+  `source_message_id`, lifecycle state, entities JSONB, and an optional
+  `halfvec(2048)` embedding.
 - `memory_edges`: knowledge edges only: `RELATED_TO`, `SHARED_ENTITY`, and directed `CAUSES`.
+- `memory_lifecycle_edges`: consolidation lineage and contradiction edges.
+- `memory_consolidation_decisions`: versioned, unordered pair decisions.
 - `messages` and `sessions`: immutable source conversation records.
 
-Important current limitations:
+The original limitations addressed by this implementation were:
 
 - All memories are treated as equally active.
 - A memory can reference only one direct source message.
@@ -79,7 +95,8 @@ Instead:
 selected active seeds x Top-K candidates
 ```
 
-The first implementation may expose a manually invoked batch function. A scheduler or worker can call the same function later.
+The implementation exposes a manually invoked batch function and CLI. A
+scheduler or worker can call the same function later.
 
 ### 3.2 Pair-based tracking
 
@@ -142,7 +159,9 @@ Each unevaluated pair is sent to Jev with a shared state containing two complete
 }
 ```
 
-For a background pair, `current_memory` is the later-created memory. Recency alone must never prove supersession; the text must explicitly express replacement or correction.
+`current_memory` is the seed being examined and `candidate_memory` is the
+retrieved candidate. Insertion order does not establish factual recency, so
+supersession is evaluated explicitly in both directions.
 
 ### 4.1 Independent Noul questions
 
@@ -160,9 +179,11 @@ Do the memories make incompatible claims about the same subject under compatible
 - True: both claims cannot be accepted simultaneously.
 - False: compatible details, uncertainty, different subjects, or an explicit update explains the difference.
 
-#### Supersession
+#### Supersession in both directions
 
 Does `current_memory` explicitly replace or correct a previously valid fact in `candidate_memory`?
+
+Does `candidate_memory` explicitly replace or correct a previously valid fact in `current_memory`?
 
 - True: the newer claim is an explicit update or correction.
 - False: mere recency, different wording, or an unrelated fact.
@@ -282,9 +303,11 @@ Action:
 - when either memory enters retrieval evidence, deterministically add the contradictory counterpart;
 - allow evidence assessment and the answering model to see the unresolved conflict.
 
-## 6. Proposed database schema
+## 6. Implemented database schema
 
-This section describes a proposed migration, likely `012_memory_consolidation.sql`. It has not been applied.
+The schema was split into migrations `012` through `016` so each concept could
+be reviewed and applied independently. The snippets below summarize the
+resulting shape; the migration files are the executable source of truth.
 
 ### 6.1 Extend `memories`
 
@@ -305,7 +328,6 @@ ALTER TABLE memories
         REFERENCES memories(id),
     ADD COLUMN last_consolidated_at TIMESTAMPTZ,
     ADD COLUMN last_consolidated_version TEXT,
-    ADD COLUMN updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     ADD CHECK (
         replaced_by_memory_id IS NULL
         OR replaced_by_memory_id <> id
@@ -393,7 +415,7 @@ CREATE TABLE memory_consolidation_run_memories (
     memory_id BIGINT NOT NULL
         REFERENCES memories(id),
     status TEXT NOT NULL DEFAULT 'PENDING' CHECK (
-        status IN ('PENDING', 'PROCESSING', 'COMPLETED', 'FAILED')
+        status IN ('PENDING', 'COMPLETED', 'FAILED')
     ),
     processed_at TIMESTAMPTZ,
     error_message TEXT,
@@ -413,6 +435,7 @@ CREATE TABLE memory_consolidation_decisions (
     memory_a_id BIGINT NOT NULL REFERENCES memories(id),
     memory_b_id BIGINT NOT NULL REFERENCES memories(id),
     current_memory_id BIGINT NOT NULL REFERENCES memories(id),
+    candidate_memory_id BIGINT NOT NULL REFERENCES memories(id),
 
     redundancy_score REAL NOT NULL CHECK (
         redundancy_score BETWEEN 0 AND 1
@@ -420,8 +443,11 @@ CREATE TABLE memory_consolidation_decisions (
     contradiction_score REAL NOT NULL CHECK (
         contradiction_score BETWEEN 0 AND 1
     ),
-    supersession_score REAL NOT NULL CHECK (
-        supersession_score BETWEEN 0 AND 1
+    current_supersedes_candidate_score REAL NOT NULL CHECK (
+        current_supersedes_candidate_score BETWEEN 0 AND 1
+    ),
+    candidate_supersedes_current_score REAL NOT NULL CHECK (
+        candidate_supersedes_current_score BETWEEN 0 AND 1
     ),
 
     representation TEXT NOT NULL CHECK (
@@ -453,6 +479,7 @@ CREATE TABLE memory_consolidation_decisions (
     ),
     result_memory_id BIGINT REFERENCES memories(id),
     applied_at TIMESTAMPTZ,
+    action_error TEXT,
 
     CHECK (memory_a_id < memory_b_id),
     CHECK (
@@ -466,7 +493,9 @@ CREATE INDEX memory_consolidation_decisions_run_idx
     ON memory_consolidation_decisions (run_id);
 ```
 
-`memory_a_id` and `memory_b_id` always use ascending order. `current_memory_id` preserves the direction used by the supersession question.
+`memory_a_id` and `memory_b_id` always use ascending order.
+`current_memory_id` and `candidate_memory_id` preserve both roles used by the
+two directional supersession questions.
 
 `representation_probabilities` stores the full Choice distribution. Automatic merge decisions must use the selected option's probability, not a separate generic confidence value.
 
@@ -517,11 +546,11 @@ Directions:
 
 This table is also the normalized equivalent of `source_memory_ids`. Do not store source-memory arrays on `memories`; query incoming `REDUNDANT_OF` or `MERGED_INTO` relationships instead.
 
-## 7. Existing code that must change
+## 7. Implemented code changes
 
 ### 7.1 Database reads
 
-The following functions currently read every memory and must default to `m.status = 'ACTIVE'`:
+The following functions now default to `m.status = 'ACTIVE'`:
 
 - `load_memories_with_sources`;
 - `search_vector_candidates`;
@@ -685,7 +714,7 @@ query
 
 Redundant, merged-source, and superseded memories do not enter normal anchors or graph expansion. Their content remains accessible through explicit audit/provenance functions.
 
-## 11. Suggested implementation sequence
+## 11. Implementation sequence used
 
 Implement one concept at a time:
 
