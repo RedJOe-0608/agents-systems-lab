@@ -63,7 +63,7 @@ def call_model(messages):
 
     return assistant_message, usage
 
-def run_agent_turn(messages, conversation_summary, summarized_until, *, max_steps):
+def run_agent_turn(messages, conversation_summary, summarized_until, *, max_steps, memory_context="",):
     """
     Run the agent loop for one user turn.
 
@@ -86,7 +86,7 @@ def run_agent_turn(messages, conversation_summary, summarized_until, *, max_step
     for step in range(max_steps):
         print(f"\n--- Agent step {step + 1} ---")
 
-        context_messages = build_context(messages, conversation_summary, summarized_until)
+        context_messages = build_context(messages, conversation_summary, summarized_until, memory_context=memory_context)
 
         print(f"Messages stored: {len(messages)}")
         print(f"Context messages sent: {len(context_messages)}")

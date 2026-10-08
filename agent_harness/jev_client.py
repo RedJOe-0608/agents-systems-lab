@@ -256,6 +256,363 @@ def build_relation_edges(
 
     return edges
 
+def build_consolidation_questions(
+    pair_count: int,
+) -> dict:
+    questions = {}
+
+    for index in range(pair_count):
+        pair = (
+            f"Compare `pairs[{index}].current_memory.content` "
+            f"with `pairs[{index}].candidate_memory.content`. "
+        )
+
+        questions[f"pair_{index}_redundancy"] = {
+            "type": "noul",
+            "instructions": (
+                pair
+                + "Does one memory repeat the same fact as the other "
+                "without adding a recallable detail?"
+            ),
+            "criteria": {
+                "true": (
+                    "One memory is a duplicate or paraphrase of the "
+                    "other and contributes no unique detail or "
+                    "time-specific update."
+                ),
+                "false": (
+                    "The memories describe different facts or events, "
+                    "or either memory adds a meaningful detail, "
+                    "correction, or update."
+                ),
+            },
+        }
+
+        questions[f"pair_{index}_contradiction"] = {
+            "type": "noul",
+            "instructions": (
+                pair
+                + "Do the memories make incompatible claims about "
+                "the same subject under compatible context?"
+            ),
+            "criteria": {
+                "true": (
+                    "The memories make claims that cannot both be true "
+                    "for the same subject, time, and context."
+                ),
+                "false": (
+                    "The memories are compatible, concern different "
+                    "subjects or contexts, express uncertainty, or "
+                    "describe a change over time that explains the "
+                    "difference."
+                ),
+            },
+        }
+
+        questions[
+            f"pair_{index}_current_supersedes_candidate"
+        ] = {
+            "type": "noul",
+            "instructions": (
+                f"Does `pairs[{index}].current_memory.content` "
+                f"explicitly replace or correct a previously valid "
+                f"fact in `pairs[{index}].candidate_memory.content`?"
+            ),
+            "criteria": {
+                "true": (
+                    "The current memory explicitly states an update, "
+                    "replacement, migration, correction, or change from "
+                    "the candidate memory's previously valid fact."
+                ),
+                "false": (
+                    "There is only different wording, mere insertion "
+                    "order, an unrelated fact, a separate event, or no "
+                    "explicit evidence that the candidate fact was "
+                    "replaced."
+                ),
+            },
+        }
+
+        questions[
+            f"pair_{index}_candidate_supersedes_current"
+        ] = {
+            "type": "noul",
+            "instructions": (
+                f"Does `pairs[{index}].candidate_memory.content` "
+                f"explicitly replace or correct a previously valid "
+                f"fact in `pairs[{index}].current_memory.content`?"
+            ),
+            "criteria": {
+                "true": (
+                    "The candidate memory explicitly states an update, "
+                    "replacement, migration, correction, or change from "
+                    "the current memory's previously valid fact."
+                ),
+                "false": (
+                    "There is only different wording, mere insertion "
+                    "order, an unrelated fact, a separate event, or no "
+                    "explicit evidence that the current fact was "
+                    "replaced."
+                ),
+            },
+        }
+
+        questions[f"pair_{index}_representation"] = {
+            "type": "choice",
+            "instructions": (
+                pair
+                + "Which representation best fits the relationship "
+                "between these two memories? Judge only from the "
+                "supplied content."
+            ),
+            "criteria": {
+                "keep_separate": (
+                    "The memories are distinct facts or events, contain "
+                    "details that should remain independently represented, "
+                    "or make contradictory claims."
+                ),
+                "merge": (
+                    "The memories describe the same fact or event, contain "
+                    "compatible explicit details, and can be combined "
+                    "without losing information."
+                ),
+                "uncertain": (
+                    "The supplied evidence is insufficient to safely "
+                    "choose between keeping the memories separate and "
+                    "merging them."
+                ),
+            },
+        }
+
+    return questions
+
+def parse_choice_answer(
+    answer: dict,
+    question_id: str,
+    options: tuple[str, ...],
+) -> dict:
+    if not isinstance(answer, dict):
+        raise ValueError(
+            f"Missing Jev Choice answer: {question_id}"
+        )
+
+    if answer.get("type") != "choice":
+        raise ValueError(
+            f"Jev answer must be a Choice: {question_id}"
+        )
+
+    selected = answer.get("choice")
+    expected_options = set(options)
+
+    if selected not in expected_options:
+        raise ValueError(
+            f"Invalid Jev Choice selection: {question_id}"
+        )
+
+    probabilities = answer.get("probabilities")
+
+    if not isinstance(probabilities, dict):
+        raise ValueError(
+            f"Missing Jev Choice probabilities: {question_id}"
+        )
+
+    if set(probabilities) != expected_options:
+        raise ValueError(
+            f"Invalid Jev Choice options: {question_id}"
+        )
+
+    parsed_probabilities = {}
+
+    for option in options:
+        probability = probabilities[option]
+
+        if (
+            type(probability) not in {int, float}
+            or not math.isfinite(probability)
+            or not 0.0 <= probability <= 1.0
+        ):
+            raise ValueError(
+                f"Invalid Jev Choice probability: "
+                f"{question_id}.{option}"
+            )
+
+        parsed_probabilities[option] = float(probability)
+
+    if not math.isclose(
+        sum(parsed_probabilities.values()),
+        1.0,
+        rel_tol=0.0,
+        abs_tol=1e-6,
+    ):
+        raise ValueError(
+            f"Jev Choice probabilities must sum to 1: "
+            f"{question_id}"
+        )
+
+    selected_probability = parsed_probabilities[selected]
+    highest_probability = max(parsed_probabilities.values())
+
+    if not math.isclose(
+        selected_probability,
+        highest_probability,
+        rel_tol=0.0,
+        abs_tol=1e-9,
+    ):
+        raise ValueError(
+            f"Jev Choice selection is not highest-probability: "
+            f"{question_id}"
+        )
+
+    return {
+        "choice": selected,
+        "probability": selected_probability,
+        "probabilities": parsed_probabilities,
+    }
+
+def parse_noul_answer(
+    answer: dict,
+    question_id: str,
+) -> float:
+    if not isinstance(answer, dict):
+        raise ValueError(
+            f"Missing Jev Noul answer: {question_id}"
+        )
+
+    if answer.get("type") != "noul":
+        raise ValueError(
+            f"Jev answer must be a Noul: {question_id}"
+        )
+
+    probability = answer.get("noul")
+
+    if (
+        type(probability) not in {int, float}
+        or not math.isfinite(probability)
+        or not 0.0 <= probability <= 1.0
+    ):
+        raise ValueError(
+            f"Invalid Jev Noul probability: {question_id}"
+        )
+
+    return float(probability)
+
+def build_consolidation_state(
+    memory_pairs: list[tuple],
+) -> dict:
+    pairs = []
+
+    for current_row, candidate_row in memory_pairs:
+        pairs.append({
+            "current_memory": {
+                "memory_id": current_row[0],
+                "content": current_row[1],
+                "entities": current_row[2],
+                "created_at": current_row[3].isoformat(),
+            },
+            "candidate_memory": {
+                "memory_id": candidate_row[0],
+                "content": candidate_row[1],
+                "entities": candidate_row[2],
+                "created_at": candidate_row[3].isoformat(),
+            },
+        })
+
+    return {
+        "pairs": pairs,
+    }
+
+def parse_consolidation_answers(
+    response: dict,
+    memory_pairs: list[tuple],
+) -> list[dict]:
+    if not isinstance(response, dict):
+        raise ValueError(
+            "Jev consolidation response must be an object"
+        )
+
+    answers = response.get("answers")
+
+    if not isinstance(answers, dict):
+        raise ValueError(
+            "Jev consolidation response must contain "
+            "an answers object"
+        )
+
+    decisions = []
+
+    for index, (current_row, candidate_row) in enumerate(
+        memory_pairs
+    ):
+        prefix = f"pair_{index}"
+
+        representation = parse_choice_answer(
+            answers.get(f"{prefix}_representation"),
+            f"{prefix}_representation",
+            (
+                "keep_separate",
+                "merge",
+                "uncertain",
+            ),
+        )
+
+        decisions.append({
+            "current_memory_id": current_row[0],
+            "candidate_memory_id": candidate_row[0],
+            "redundancy": parse_noul_answer(
+                answers.get(f"{prefix}_redundancy"),
+                f"{prefix}_redundancy",
+            ),
+            "contradiction": parse_noul_answer(
+                answers.get(f"{prefix}_contradiction"),
+                f"{prefix}_contradiction",
+            ),
+            "current_supersedes_candidate": (
+                parse_noul_answer(
+                    answers.get(
+                        f"{prefix}_current_supersedes_candidate"
+                    ),
+                    (
+                        f"{prefix}_"
+                        "current_supersedes_candidate"
+                    ),
+                )
+            ),
+            "candidate_supersedes_current": (
+                parse_noul_answer(
+                    answers.get(
+                        f"{prefix}_candidate_supersedes_current"
+                    ),
+                    (
+                        f"{prefix}_"
+                        "candidate_supersedes_current"
+                    ),
+                )
+            ),
+            "representation": representation,
+        })
+
+    return decisions
+
+def evaluate_consolidation_pairs(
+    memory_pairs: list[tuple],
+) -> list[dict]:
+    if not memory_pairs:
+        return []
+
+    state = build_consolidation_state(memory_pairs)
+
+    questions = build_consolidation_questions(
+        len(memory_pairs)
+    )
+
+    response = evaluate_jev(state, questions)
+
+    return parse_consolidation_answers(
+        response,
+        memory_pairs,
+    )
+
+
 def build_query_routing_questions() -> dict:
     return {
         "semantic": {

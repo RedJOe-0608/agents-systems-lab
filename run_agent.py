@@ -12,6 +12,10 @@ from agent_harness.db import (
 )
 from agent_harness.embedding_client import embed_text
 from agent_harness.jev_client import build_relation_edges, evaluate_memory_relations
+from agent_harness.memory_retrieval import (
+    format_memory_context,
+    retrieve_memory_evidence,
+)
 
 MAX_STEPS = 5
 MAX_CONTEXT_TURNS = 3 # decides how many recent turns stay in the context verbatim. The older turns become eligible for compaction.
@@ -142,11 +146,25 @@ def main():
                 compaction_batch_turns=COMPACTION_BATCH_TURNS,
             )
 
+            retrieval = retrieve_memory_evidence(user_message)
+
+            memory_context = format_memory_context(
+                retrieval["evidence"]
+            )
+
+            print(
+                "Memory retrieval: "
+                f"evidence={len(retrieval['evidence'])}, "
+                f"depth={retrieval['depth']}, "
+                f"stop={retrieval['stop_reason']}"
+            )
+
             final_answer, turn_usage = run_agent_turn(
                 messages,
                 conversation_summary,
                 summarized_until,
                 max_steps=MAX_STEPS,
+                memory_context=memory_context
             )
         except ModelRequestError as error:
             print(f"\nModel request failed: {error}")

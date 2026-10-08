@@ -74,12 +74,38 @@ def load_memories_with_sources():
             SELECT m.id, m.text, m.source_message_id, m.entities,
                    msg.role, msg.payload
             FROM memories AS m
-            JOIN messages AS msg ON msg.id = m.source_message_id
+            LEFT JOIN messages AS msg
+                ON msg.id = m.source_message_id
+            WHERE m.status = 'ACTIVE'
             ORDER BY m.id
             """
         ).fetchall()
 
-def search_vector_candidates(embedding: list[float], limit: int = 30):
+def load_consolidation_seeds(
+    decision_version: str,
+    batch_limit: int,
+):
+    with connect_db() as conn:
+        return conn.execute(
+            """
+            SELECT id, text, entities, created_at, embedding
+            FROM memories
+            WHERE status = 'ACTIVE'
+              AND last_consolidated_version
+                  IS DISTINCT FROM %s
+            ORDER BY
+                last_consolidated_at NULLS FIRST,
+                created_at,
+                id
+            LIMIT %s
+            """,
+            (decision_version, batch_limit),
+        ).fetchall()
+
+def search_vector_candidates(
+    embedding: list[float],
+    limit: int = 30,
+):
     query_vector = HalfVector(embedding)
 
     with connect_db() as conn:
@@ -89,8 +115,10 @@ def search_vector_candidates(embedding: list[float], limit: int = 30):
                    msg.role, msg.payload,
                    1 - (m.embedding <=> %s) AS similarity
             FROM memories AS m
-            JOIN messages AS msg ON msg.id = m.source_message_id
-            WHERE m.embedding IS NOT NULL
+            LEFT JOIN messages AS msg
+                ON msg.id = m.source_message_id
+            WHERE m.status = 'ACTIVE'
+              AND m.embedding IS NOT NULL
             ORDER BY m.embedding <=> %s
             LIMIT %s
             """,
@@ -104,7 +132,11 @@ def find_entity_candidate_ids(entities: list[dict]) -> list[int]:
 
     with connect_db() as conn:
         rows = conn.execute(
-            "SELECT id, entities FROM memories"
+            """
+            SELECT id, entities
+            FROM memories
+            WHERE status = 'ACTIVE'
+            """
         ).fetchall()
 
     return [
@@ -114,7 +146,8 @@ def find_entity_candidate_ids(entities: list[dict]) -> list[int]:
     ]
 
 def load_candidates_by_ids(
-    candidate_ids: set[int], embedding: list[float]
+    candidate_ids: set[int],
+    embedding: list[float],
 ):
     if not candidate_ids:
         return []
@@ -131,8 +164,10 @@ def load_candidates_by_ids(
                        ELSE 1 - (m.embedding <=> %s)
                    END AS similarity
             FROM memories AS m
-            JOIN messages AS msg ON msg.id = m.source_message_id
+            LEFT JOIN messages AS msg
+                ON msg.id = m.source_message_id
             WHERE m.id = ANY(%s)
+              AND m.status = 'ACTIVE'
             ORDER BY m.id
             """,
             (query_vector, sorted(candidate_ids)),
@@ -197,14 +232,70 @@ def find_write_candidates(
     entities: list[dict],
     embedding: list[float],
     limit: int = 10,
+    exclude_memory_id: int | None = None,
 ):
     candidate_ids = {
         row[0] for row in search_vector_candidates(embedding)
     }
     candidate_ids.update(find_entity_candidate_ids(entities))
 
+    if exclude_memory_id is not None:
+        candidate_ids.discard(exclude_memory_id)
+
     rows = load_candidates_by_ids(candidate_ids, embedding)
     return rank_write_candidates(text, entities, rows, limit)
+
+def find_consolidation_candidates(
+    seed_row: tuple,
+    limit: int = 10,
+):
+    seed_id = seed_row[0]
+    seed_text = seed_row[1]
+    seed_entities = seed_row[2]
+    seed_embedding = seed_row[4]
+
+    if seed_embedding is None:
+        raise ValueError(
+            f"Memory {seed_id} has no embedding"
+        )
+
+    ranked_candidates = find_write_candidates(
+        seed_text,
+        seed_entities,
+        seed_embedding.to_list(),
+        limit=limit,
+        exclude_memory_id=seed_id,
+    )
+
+    candidate_ids = [
+        row[0]
+        for row, _score in ranked_candidates
+    ]
+
+    if not candidate_ids:
+        return []
+
+    with connect_db() as conn:
+        rows = conn.execute(
+            """
+            SELECT id, text, entities, created_at, embedding
+            FROM memories
+            WHERE id = ANY(%s)
+              AND status = 'ACTIVE'
+            """,
+            (candidate_ids,),
+        ).fetchall()
+
+    rows_by_id = {
+        row[0]: row
+        for row in rows
+    }
+
+    return [
+        rows_by_id[memory_id]
+        for memory_id in candidate_ids
+        if memory_id in rows_by_id
+    ]
 
 def search_bm25_candidates(
     text: str, exclude_memory_id: int | None = None, limit: int = 10
@@ -391,9 +482,10 @@ def load_graph_neighbors(
                         THEN edge.target_memory_id
                     ELSE edge.source_memory_id
                 END
-            JOIN messages AS msg
+            LEFT JOIN messages AS msg
                 ON msg.id = neighbor.source_message_id
-            WHERE edge.relation_type = ANY(%s)
+            WHERE neighbor.status = 'ACTIVE'
+                AND edge.relation_type = ANY(%s)
               AND (
                   edge.source_memory_id = ANY(%s)
                   OR edge.target_memory_id = ANY(%s)

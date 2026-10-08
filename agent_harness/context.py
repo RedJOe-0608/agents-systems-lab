@@ -2,13 +2,22 @@ def build_context(
     messages,
     conversation_summary,
     summarized_until,
+    memory_context="",
 ):
     """
-    Build context from the system prompt, rolling summary,
-    and recent verbatim messages.
+    Build context from the system prompt, long-term memory,
+    rolling summary, and recent verbatim messages.
     """
 
-    context_messages = [messages[0]]
+    system_message = dict(messages[0])
+
+    if memory_context:
+        system_message["content"] = (
+            f"{system_message['content']}\n\n"
+            f"{memory_context}"
+        )
+
+    context_messages = [system_message]
 
     if conversation_summary:
         context_messages.append(
