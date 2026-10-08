@@ -207,12 +207,17 @@ def find_write_candidates(
     return rank_write_candidates(text, entities, rows, limit)
 
 def search_bm25_candidates(
-    text: str, exclude_memory_id: int, limit: int = 10
+    text: str, exclude_memory_id: int | None = None, limit: int = 10
 ):
-    rows = [
-        row for row in load_memories_with_sources()
-        if row[0] != exclude_memory_id
-    ]
+    rows = load_memories_with_sources()
+
+    if exclude_memory_id is not None:
+        rows = [
+            row
+            for row in rows
+            if row[0] != exclude_memory_id
+        ]
+
     query_tokens = sorted(set(tokenize_memory(text)))
     documents = [tokenize_memory(row[1]) for row in rows]
 
@@ -268,3 +273,173 @@ def save_memory_edges(edges: list[dict]) -> list[int]:
             edge_ids.append(row[0])
 
     return edge_ids
+
+def reciprocal_rank_fusion(
+    ranked_id_lists: list[list[int]],
+    limit: int,
+    rank_constant: int = 60,
+) -> list[int]:
+    scores = {}
+
+    for ranked_ids in ranked_id_lists:
+        for rank, memory_id in enumerate(ranked_ids, start=1):
+            contribution = 1.0 / (rank_constant + rank)
+
+            scores[memory_id] = (
+                scores.get(memory_id, 0.0)
+                + contribution
+            )
+
+    ordered_ids = sorted(
+        scores,
+        key=lambda memory_id: (
+            -scores[memory_id],
+            memory_id,
+        ),
+    )
+
+    return ordered_ids[:limit]
+
+def find_query_anchors(
+    query: str,
+    embedding: list[float],
+    limit: int = 10,
+    search_limit: int = 30,
+):
+    vector_rows = search_vector_candidates(
+        embedding,
+        limit=search_limit,
+    )
+
+    keyword_matches = search_bm25_candidates(
+        query,
+        limit=search_limit,
+    )
+
+    vector_ids = [
+        row[0]
+        for row in vector_rows
+    ]
+
+    keyword_ids = [
+        row[0]
+        for row, _score in keyword_matches
+    ]
+
+    anchor_ids = reciprocal_rank_fusion(
+        [vector_ids, keyword_ids],
+        limit=limit,
+    )
+
+    if not anchor_ids:
+        return []
+
+    rows = load_candidates_by_ids(
+        set(anchor_ids),
+        embedding,
+    )
+
+    rows_by_id = {
+        row[0]: row
+        for row in rows
+    }
+
+    return [
+        rows_by_id[memory_id]
+        for memory_id in anchor_ids
+        if memory_id in rows_by_id
+    ]
+
+def load_graph_neighbors(
+    frontier_ids: set[int],
+    active_graphs: dict,
+):
+    if not frontier_ids or not active_graphs:
+        return []
+
+    graph_relation_types = {
+        "semantic": "RELATED_TO",
+        "causal": "CAUSES",
+        "entity": "SHARED_ENTITY",
+    }
+
+    relation_types = [
+        graph_relation_types[graph]
+        for graph in active_graphs
+    ]
+
+    frontier_list = sorted(frontier_ids)
+
+    with connect_db() as conn:
+        return conn.execute(
+            """
+            SELECT
+                neighbor.id,
+                neighbor.text,
+                neighbor.entities,
+                neighbor.source_message_id,
+                msg.role,
+                msg.payload,
+                edge.relation_type,
+                edge.score,
+                edge.source_memory_id,
+                edge.target_memory_id
+            FROM memory_edges AS edge
+            JOIN memories AS neighbor
+                ON neighbor.id = CASE
+                    WHEN edge.source_memory_id = ANY(%s)
+                        THEN edge.target_memory_id
+                    ELSE edge.source_memory_id
+                END
+            JOIN messages AS msg
+                ON msg.id = neighbor.source_message_id
+            WHERE edge.relation_type = ANY(%s)
+              AND (
+                  edge.source_memory_id = ANY(%s)
+                  OR edge.target_memory_id = ANY(%s)
+              )
+            ORDER BY edge.score DESC, edge.id
+            """,
+            (
+                frontier_list,
+                relation_types,
+                frontier_list,
+                frontier_list,
+            ),
+        ).fetchall()
+
+def select_graph_expansion_candidates(
+    neighbor_rows: list[tuple],
+    visited_ids: set[int],
+    graph_budgets: dict,
+    graph_budget_used: dict,
+):
+    relation_graphs = {
+        "RELATED_TO": "semantic",
+        "CAUSES": "causal",
+        "SHARED_ENTITY": "entity",
+    }
+
+    selected = []
+    selected_ids = set()
+    updated_usage = dict(graph_budget_used)
+
+    for row in neighbor_rows:
+        neighbor_id = row[0]
+        relation_type = row[6]
+        graph = relation_graphs[relation_type]
+
+        if neighbor_id in visited_ids:
+            continue
+
+        if neighbor_id in selected_ids:
+            continue
+
+        if updated_usage[graph] >= graph_budgets[graph]:
+            continue
+
+        selected.append(row)
+        selected_ids.add(neighbor_id)
+        updated_usage[graph] += 1
+
+    return selected, updated_usage
