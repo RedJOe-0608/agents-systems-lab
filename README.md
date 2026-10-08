@@ -9,6 +9,24 @@ consolidation. Consolidation can canonicalize redundant memories, preserve
 contradictions, apply explicit supersession, and create source-linked merged
 memories without deleting raw evidence.
 
+The main code boundaries are intentionally shallow:
+
+```text
+agent_harness/
+├── storage/
+│   ├── connection.py       # PostgreSQL connection setup
+│   ├── conversations.py    # sessions and messages
+│   ├── memories.py         # memory search, candidates, and knowledge edges
+│   └── consolidation.py    # runs, decisions, and lifecycle reads
+├── memory_extraction.py    # facts extracted from conversations
+├── memory_retrieval.py     # evidence retrieval and graph expansion
+├── memory_consolidation.py # pair discovery, merge preparation, batch runner
+└── memory_lifecycle.py     # atomic lifecycle actions and edge rewiring
+```
+
+Model clients, runtime/context construction, and tools remain as flat modules
+because they are already individually focused.
+
 Run one consolidation batch manually:
 
 ```bash

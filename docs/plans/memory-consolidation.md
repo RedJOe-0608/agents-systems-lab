@@ -11,9 +11,12 @@ The implementation is split across:
 
 - migrations `012` through `016` for lifecycle, origin, active indexes,
   scheduling progress, run records, pair decisions, and lifecycle edges;
-- `agent_harness/memory_consolidation.py` for policy, transactional actions,
-  generated merges, and batch orchestration;
-- `agent_harness/db.py` for persistence and active-memory queries;
+- `agent_harness/memory_consolidation.py` for pair discovery, generated-merge
+  preparation, and batch orchestration;
+- `agent_harness/memory_lifecycle.py` for action selection and transactional
+  lifecycle mutations;
+- `agent_harness/storage/` for connections, conversations, memory queries,
+  consolidation runs, decisions, and lifecycle reads;
 - `agent_harness/memory_retrieval.py` for contradiction counterpart retrieval;
 - `run_memory_consolidation.py` for manual invocation.
 
