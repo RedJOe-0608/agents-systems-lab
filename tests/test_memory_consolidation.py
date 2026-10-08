@@ -5,7 +5,10 @@ from psycopg.types.json import Jsonb
 from agent_harness.db import connect_db
 from agent_harness.memory_consolidation import (
     _deactivate_memory,
+    apply_merge_decision,
     choose_consolidation_action,
+    merge_memory_entities,
+    parse_merged_memory_text,
 )
 
 
@@ -55,6 +58,36 @@ class ConsolidationPolicyTests(unittest.TestCase):
         self.assertEqual(
             choose_consolidation_action(decision),
             "MERGED",
+        )
+
+    def test_merge_output_is_strict_json(self):
+        self.assertEqual(
+            parse_merged_memory_text('{"text": "Merged fact."}'),
+            "Merged fact.",
+        )
+
+        with self.assertRaises(ValueError):
+            parse_merged_memory_text("Merged fact.")
+
+    def test_entities_are_deduplicated_by_name(self):
+        memories = [
+            {
+                "entities": [{
+                    "name": "PostgreSQL",
+                    "context": "Database",
+                }],
+            },
+            {
+                "entities": [{
+                    "name": " postgresql ",
+                    "context": "Backend",
+                }],
+            },
+        ]
+
+        self.assertEqual(
+            merge_memory_entities(memories),
+            [{"name": "PostgreSQL", "context": "Database"}],
         )
 
 
@@ -232,6 +265,118 @@ class ReplacementTransactionTests(unittest.TestCase):
             (source_id, target_id),
         ).fetchone()
         self.assertIsNotNone(rewired_contradiction)
+
+    def test_merge_inserts_result_before_deactivating_sources(self):
+        canonical_id, duplicate_id, _neighbor_id, _earlier_id = (
+            self.memory_ids
+        )
+        memory_a_id, memory_b_id = sorted(
+            (canonical_id, duplicate_id)
+        )
+        merge_decision_id = self.conn.execute(
+            """
+            INSERT INTO memory_consolidation_decisions (
+                memory_a_id,
+                memory_b_id,
+                current_memory_id,
+                candidate_memory_id,
+                redundancy_score,
+                contradiction_score,
+                current_supersedes_candidate_score,
+                candidate_supersedes_current_score,
+                representation,
+                representation_probability,
+                representation_probabilities,
+                decision_version,
+                model_id
+            )
+            VALUES (
+                %s, %s, %s, %s,
+                0.0, 0.0, 0.0, 0.0,
+                'merge', 0.95, %s, 'merge-test', 'test'
+            )
+            RETURNING id
+            """,
+            (
+                memory_a_id,
+                memory_b_id,
+                canonical_id,
+                duplicate_id,
+                Jsonb({
+                    "keep_separate": 0.03,
+                    "merge": 0.95,
+                    "uncertain": 0.02,
+                }),
+            ),
+        ).fetchone()[0]
+        self.conn.commit()
+        merged_id = None
+
+        try:
+            result = apply_merge_decision(
+                merge_decision_id,
+                {
+                    "text": "merged result",
+                    "entities": [],
+                    "embedding": [0.0] * 2048,
+                    "relation_decisions": [],
+                },
+            )
+
+            merged_id = result["result_memory_id"]
+            merged = self.conn.execute(
+                """
+                SELECT status, origin_type, source_message_id
+                FROM memories
+                WHERE id = %s
+                """,
+                (merged_id,),
+            ).fetchone()
+            self.assertEqual(merged, ("ACTIVE", "MERGED", None))
+
+            source_rows = self.conn.execute(
+                """
+                SELECT status, replaced_by_memory_id
+                FROM memories
+                WHERE id = ANY(%s)
+                ORDER BY id
+                """,
+                ([canonical_id, duplicate_id],),
+            ).fetchall()
+            self.assertEqual(
+                source_rows,
+                [
+                    ("MERGED_SOURCE", merged_id),
+                    ("MERGED_SOURCE", merged_id),
+                ],
+            )
+        finally:
+            cleanup_ids = list(self.memory_ids)
+
+            if merged_id is not None:
+                cleanup_ids.append(merged_id)
+
+            cleanup_conn = connect_db()
+            cleanup_conn.execute(
+                "DELETE FROM memory_lifecycle_edges WHERE decision_id IN (%s, %s)",
+                (self.decision_id, merge_decision_id),
+            )
+            cleanup_conn.execute(
+                "DELETE FROM memory_edges WHERE source_memory_id = ANY(%s) OR target_memory_id = ANY(%s)",
+                (cleanup_ids, cleanup_ids),
+            )
+            cleanup_conn.execute(
+                "DELETE FROM memory_consolidation_decisions WHERE id IN (%s, %s)",
+                (self.decision_id, merge_decision_id),
+            )
+            cleanup_conn.execute(
+                "DELETE FROM memories WHERE id = ANY(%s)",
+                (cleanup_ids,),
+            )
+            cleanup_conn.commit()
+            cleanup_conn.close()
+            self.conn.close()
+            self.conn = connect_db()
 
 
 if __name__ == "__main__":

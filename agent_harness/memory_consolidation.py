@@ -1,14 +1,38 @@
-from psycopg.rows import dict_row
+import json
 
+from pgvector import HalfVector
+from psycopg.rows import dict_row
+from psycopg.types.json import Jsonb
+
+from agent_harness.config import API_KEY, BASE_URL, MODEL_ID
 from agent_harness.db import (
     connect_db,
     find_consolidation_candidates,
+    find_write_candidates,
 )
+from agent_harness.embedding_client import embed_text
+from agent_harness.jev_client import (
+    build_relation_edges,
+    evaluate_memory_relations,
+)
+from agent_harness.model_client import request_chat_completion
 
 
 CONSOLIDATION_DECISION_VERSION = "v1"
 CONSOLIDATION_MODEL_ID = "jev-latest"
 CONSOLIDATION_THRESHOLD = 0.85
+
+MERGE_SYSTEM_PROMPT = """
+Combine the supplied memories into one self-contained durable fact.
+
+Use only details explicitly supported by the supplied memories. Preserve every
+compatible detail that will matter for future recall. Do not infer a broader
+preference, habit, personality trait, or general pattern. Do not mention memory
+IDs or the act of merging.
+
+Return only valid JSON, with no Markdown, in this shape:
+{"text": "One atomic merged memory."}
+""".strip()
 
 
 def discover_consolidation_pairs(
@@ -565,3 +589,328 @@ def apply_non_merge_decision(decision_id: int) -> dict:
             "action": action,
             "result_memory_id": result_memory_id,
         }
+
+
+def _load_decision_snapshot(decision_id: int) -> dict:
+    with connect_db() as conn:
+        with conn.cursor(row_factory=dict_row) as cursor:
+            cursor.execute(
+                """
+                SELECT *
+                FROM memory_consolidation_decisions
+                WHERE id = %s
+                """,
+                (decision_id,),
+            )
+            decision = cursor.fetchone()
+
+    if decision is None:
+        raise ValueError(
+            f"Consolidation decision {decision_id} does not exist"
+        )
+
+    return decision
+
+
+def _load_pair_memory_snapshots(decision: dict) -> list[dict]:
+    with connect_db() as conn:
+        with conn.cursor(row_factory=dict_row) as cursor:
+            cursor.execute(
+                """
+                SELECT
+                    id,
+                    text,
+                    entities,
+                    status,
+                    created_at
+                FROM memories
+                WHERE id = ANY(%s)
+                ORDER BY id
+                """,
+                ([
+                    decision["memory_a_id"],
+                    decision["memory_b_id"],
+                ],),
+            )
+            memories = cursor.fetchall()
+
+    if len(memories) != 2:
+        raise ValueError(
+            f"Decision {decision['id']} does not reference two memories"
+        )
+
+    return memories
+
+
+def parse_merged_memory_text(raw_response: str) -> str:
+    try:
+        data = json.loads(raw_response)
+    except (json.JSONDecodeError, TypeError) as error:
+        raise ValueError("Merge generator returned invalid JSON") from error
+
+    if not isinstance(data, dict):
+        raise ValueError("Merge generator response must be an object")
+
+    text = data.get("text")
+
+    if not isinstance(text, str) or not text.strip():
+        raise ValueError("Merged memory text must be non-empty")
+
+    return text.strip()
+
+
+def generate_merged_memory_text(memories: list[dict]) -> str:
+    response = request_chat_completion(
+        base_url=BASE_URL,
+        api_key=API_KEY,
+        model_id=MODEL_ID,
+        messages=[
+            {"role": "system", "content": MERGE_SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": json.dumps({
+                    "memories": [
+                        {
+                            "memory_id": memory["id"],
+                            "text": memory["text"],
+                        }
+                        for memory in memories
+                    ],
+                }),
+            },
+        ],
+    )
+
+    try:
+        raw_text = response["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError) as error:
+        raise ValueError(
+            "Merge generator returned no message content"
+        ) from error
+
+    return parse_merged_memory_text(raw_text)
+
+
+def merge_memory_entities(memories: list[dict]) -> list[dict]:
+    merged = []
+    seen_names = set()
+
+    for memory in memories:
+        for entity in memory["entities"]:
+            normalized_name = " ".join(
+                entity["name"].casefold().split()
+            )
+
+            if normalized_name in seen_names:
+                continue
+
+            seen_names.add(normalized_name)
+            merged.append({
+                "name": entity["name"],
+                "context": entity["context"],
+            })
+
+    return merged
+
+
+def prepare_merge(
+    decision_id: int,
+    candidate_limit: int = 10,
+) -> dict:
+    decision = _load_decision_snapshot(decision_id)
+
+    if decision["applied_action"] != "PENDING":
+        raise ValueError(
+            f"Decision {decision_id} is already applied"
+        )
+
+    if choose_consolidation_action(decision) != "MERGED":
+        raise ValueError(
+            f"Decision {decision_id} does not authorize a merge"
+        )
+
+    memories = _load_pair_memory_snapshots(decision)
+
+    if any(memory["status"] != "ACTIVE" for memory in memories):
+        raise ValueError("Merge sources must both still be active")
+
+    merged_text = generate_merged_memory_text(memories)
+    merged_entities = merge_memory_entities(memories)
+    merged_embedding = embed_text(merged_text)
+    source_ids = {memory["id"] for memory in memories}
+
+    write_candidates = find_write_candidates(
+        merged_text,
+        merged_entities,
+        merged_embedding,
+        limit=candidate_limit,
+        exclude_memory_ids=source_ids,
+    )
+    relation_decisions = evaluate_memory_relations(
+        merged_text,
+        merged_entities,
+        write_candidates,
+    )
+
+    return {
+        "text": merged_text,
+        "entities": merged_entities,
+        "embedding": merged_embedding,
+        "relation_decisions": relation_decisions,
+    }
+
+
+def _save_prepared_relation_edges(
+    conn,
+    new_memory_id: int,
+    relation_decisions: list[dict],
+) -> None:
+    existing_ids = {
+        decision["existing_memory_id"]
+        for decision in relation_decisions
+    }
+
+    if existing_ids:
+        active_ids = {
+            row[0]
+            for row in conn.execute(
+                """
+                SELECT id
+                FROM memories
+                WHERE id = ANY(%s)
+                  AND status = 'ACTIVE'
+                """,
+                (sorted(existing_ids),),
+            ).fetchall()
+        }
+    else:
+        active_ids = set()
+
+    current_decisions = [
+        decision
+        for decision in relation_decisions
+        if decision["existing_memory_id"] in active_ids
+    ]
+
+    for edge in build_relation_edges(
+        new_memory_id,
+        current_decisions,
+    ):
+        _save_knowledge_edge(conn, **edge)
+
+
+def apply_merge_decision(
+    decision_id: int,
+    prepared_merge: dict,
+) -> dict:
+    with connect_db() as conn:
+        decision = _load_locked_decision(conn, decision_id)
+
+        if decision["applied_action"] != "PENDING":
+            return {
+                "decision_id": decision_id,
+                "action": decision["applied_action"],
+                "result_memory_id": decision["result_memory_id"],
+            }
+
+        if choose_consolidation_action(decision) != "MERGED":
+            raise ValueError(
+                f"Decision {decision_id} no longer authorizes a merge"
+            )
+
+        memories = _load_locked_pair_memories(conn, decision)
+
+        if any(
+            memory["status"] != "ACTIVE"
+            for memory in memories.values()
+        ):
+            _mark_decision_applied(
+                conn,
+                decision_id,
+                "DEFERRED",
+            )
+            return {
+                "decision_id": decision_id,
+                "action": "DEFERRED",
+                "result_memory_id": None,
+            }
+
+        row = conn.execute(
+            """
+            INSERT INTO memories (
+                text,
+                source_message_id,
+                entities,
+                embedding,
+                origin_type,
+                last_consolidated_version,
+                last_consolidated_at
+            )
+            VALUES (
+                %s,
+                NULL,
+                %s,
+                %s,
+                'MERGED',
+                %s,
+                now()
+            )
+            RETURNING id
+            """,
+            (
+                prepared_merge["text"],
+                Jsonb(prepared_merge["entities"]),
+                HalfVector(prepared_merge["embedding"]),
+                decision["decision_version"],
+            ),
+        ).fetchone()
+        merged_memory_id = row[0]
+
+        _save_prepared_relation_edges(
+            conn,
+            merged_memory_id,
+            prepared_merge["relation_decisions"],
+        )
+
+        for source_memory_id in sorted(memories):
+            _deactivate_memory(
+                conn,
+                inactive_memory_id=source_memory_id,
+                replacement_memory_id=merged_memory_id,
+                status="MERGED_SOURCE",
+                relation_type="MERGED_INTO",
+                score=decision["representation_probability"],
+                decision_id=decision_id,
+            )
+
+        _mark_decision_applied(
+            conn,
+            decision_id,
+            "MERGED",
+            merged_memory_id,
+        )
+
+        return {
+            "decision_id": decision_id,
+            "action": "MERGED",
+            "result_memory_id": merged_memory_id,
+        }
+
+
+def apply_consolidation_decision(
+    decision: dict,
+    candidate_limit: int = 10,
+) -> dict:
+    action = choose_consolidation_action(decision)
+
+    if action == "MERGED":
+        prepared_merge = prepare_merge(
+            decision["id"],
+            candidate_limit=candidate_limit,
+        )
+        return apply_merge_decision(
+            decision["id"],
+            prepared_merge,
+        )
+
+    return apply_non_merge_decision(decision["id"])
