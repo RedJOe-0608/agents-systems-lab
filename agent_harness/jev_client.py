@@ -20,7 +20,7 @@ def build_relation_state(
 ) -> dict:
     candidates = []
 
-    for row, _score in write_candidates:
+    for row in write_candidates:
         candidates.append({
             "memory_id": row[0],
             "content": row[1],
@@ -152,7 +152,7 @@ def parse_relation_answers(
 
     decisions = []
 
-    for index, (row, _score) in enumerate(write_candidates):
+    for index, row in enumerate(write_candidates):
         probabilities = {}
 
         for relation in (

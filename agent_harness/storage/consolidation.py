@@ -50,7 +50,6 @@ def find_consolidation_candidates(
 ):
     seed_id = seed_row[0]
     seed_text = seed_row[1]
-    seed_entities = seed_row[2]
     seed_embedding = seed_row[4]
 
     if seed_embedding is None:
@@ -60,14 +59,13 @@ def find_consolidation_candidates(
 
     ranked_candidates = find_write_candidates(
         seed_text,
-        seed_entities,
         seed_embedding.to_list(),
         limit=limit,
         exclude_memory_id=seed_id,
     )
     candidate_ids = [
         row[0]
-        for row, _score in ranked_candidates
+        for row in ranked_candidates
     ]
 
     if not candidate_ids:

@@ -175,7 +175,6 @@ def prepare_merge(
 
     write_candidates = find_write_candidates(
         merged_text,
-        merged_entities,
         merged_embedding,
         limit=candidate_limit,
         exclude_memory_ids=source_ids,

@@ -557,7 +557,6 @@ The following functions now default to `m.status = 'ACTIVE'`:
 
 - `load_memories_with_sources`;
 - `search_vector_candidates`;
-- `find_entity_candidate_ids`;
 - `load_candidates_by_ids` when used for normal retrieval/candidate discovery;
 - `search_bm25_candidates` through its base loader;
 - `find_write_candidates` through the above functions;
@@ -656,7 +655,10 @@ The current Jev parser supports only Noul answers. Consolidation requires Choice
 5. Complete the run and persist counts.
 ```
 
-Candidate discovery for the first version should reuse the existing write-candidate logic: embedding similarity, entity overlap, and word overlap, bounded to Top-K. BM25 can be incorporated later if measurement shows it improves consolidation pair recall.
+Candidate discovery uses the same hybrid write-candidate logic as newly
+extracted memories: vector and BM25 Top-K results fused with reciprocal rank
+fusion, bounded to Top-K. Entity metadata is supplied to Jev for relation
+decisions, but does not affect candidate selection.
 
 The run should select memories with `last_consolidated_version IS DISTINCT FROM current_version`, ordered with never-processed memories first. A new memory naturally compares itself with older active memories, so old seeds do not need to be reprocessed merely because one new memory arrived; the unordered pair is still discovered from the new side.
 

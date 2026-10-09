@@ -7,13 +7,6 @@ from rank_bm25 import BM25Okapi
 from agent_harness.storage.connection import connect_db
 
 
-MEMORY_STOPWORDS = {
-    "a", "an", "and", "are", "as", "at", "be", "by", "for",
-    "from", "in", "is", "it", "of", "on", "or", "that",
-    "the", "this", "to", "was", "were", "with", "user",
-}
-
-
 def save_memory(
     text: str,
     source_message_id: int,
@@ -76,30 +69,6 @@ def search_vector_candidates(
         ).fetchall()
 
 
-def find_entity_candidate_ids(
-    entities: list[dict],
-) -> list[int]:
-    names = normalized_entity_names(entities)
-
-    if not names:
-        return []
-
-    with connect_db() as conn:
-        rows = conn.execute(
-            """
-            SELECT id, entities
-            FROM memories
-            WHERE status = 'ACTIVE'
-            """
-        ).fetchall()
-
-    return [
-        memory_id
-        for memory_id, stored_entities in rows
-        if names & normalized_entity_names(stored_entities)
-    ]
-
-
 def load_candidates_by_ids(
     candidate_ids: set[int],
     embedding: list[float],
@@ -133,91 +102,50 @@ def tokenize_memory(text: str) -> list[str]:
     return re.findall(r"\w+", text.casefold())
 
 
-def word_overlap(first: str, second: str) -> float:
-    first_words = set(tokenize_memory(first)) - MEMORY_STOPWORDS
-    second_words = set(tokenize_memory(second)) - MEMORY_STOPWORDS
-    all_words = first_words | second_words
-
-    if not all_words:
-        return 0.0
-
-    return len(first_words & second_words) / len(all_words)
-
-
-def normalized_entity_names(
-    entities: list[dict],
-) -> set[str]:
-    return {
-        " ".join(entity["name"].casefold().split())
-        for entity in entities
-    }
-
-
-def rank_write_candidates(
-    new_text: str,
-    new_entities: list[dict],
-    candidates: list[tuple],
-    limit: int = 10,
-):
-    new_names = normalized_entity_names(new_entities)
-    ranked = []
-
-    for row in candidates:
-        stored_names = normalized_entity_names(row[2])
-        entity_overlap = (
-            len(new_names & stored_names) / len(new_names)
-            if new_names else 0.0
-        )
-        similarity = max(0.0, min(1.0, float(row[6])))
-        overlap = word_overlap(new_text, row[1])
-
-        score = (
-            0.70 * similarity
-            + 0.20 * entity_overlap
-            + 0.10 * overlap
-        )
-        ranked.append((row, score))
-
-    ranked.sort(key=lambda item: (-item[1], item[0][0]))
-    return ranked[:limit]
-
-
 def find_write_candidates(
     text: str,
-    entities: list[dict],
     embedding: list[float],
     limit: int = 10,
     exclude_memory_id: int | None = None,
     exclude_memory_ids: set[int] | None = None,
 ):
-    candidate_ids = {
-        row[0] for row in search_vector_candidates(embedding)
-    }
-    candidate_ids.update(find_entity_candidate_ids(entities))
+    search_limit = 30
+    candidate_ids = _find_hybrid_candidate_ids(
+        text,
+        embedding,
+        limit=search_limit * 2,
+        search_limit=search_limit,
+    )
 
     if exclude_memory_id is not None:
-        candidate_ids.discard(exclude_memory_id)
+        candidate_ids = [
+            memory_id
+            for memory_id in candidate_ids
+            if memory_id != exclude_memory_id
+        ]
 
     if exclude_memory_ids:
-        candidate_ids.difference_update(exclude_memory_ids)
+        candidate_ids = [
+            memory_id
+            for memory_id in candidate_ids
+            if memory_id not in exclude_memory_ids
+        ]
 
-    rows = load_candidates_by_ids(candidate_ids, embedding)
-    return rank_write_candidates(text, entities, rows, limit)
+    candidate_ids = candidate_ids[:limit]
+    rows = load_candidates_by_ids(set(candidate_ids), embedding)
+    rows_by_id = {row[0]: row for row in rows}
+    return [
+        rows_by_id[memory_id]
+        for memory_id in candidate_ids[:limit]
+        if memory_id in rows_by_id
+    ]
 
 
 def search_bm25_candidates(
     text: str,
-    exclude_memory_id: int | None = None,
     limit: int = 10,
 ):
     rows = load_memories_with_sources()
-
-    if exclude_memory_id is not None:
-        rows = [
-            row
-            for row in rows
-            if row[0] != exclude_memory_id
-        ]
 
     query_tokens = sorted(set(tokenize_memory(text)))
     documents = [tokenize_memory(row[1]) for row in rows]
@@ -302,29 +230,43 @@ def reciprocal_rank_fusion(
     return ordered_ids[:limit]
 
 
+def _find_hybrid_candidate_ids(
+    text: str,
+    embedding: list[float],
+    limit: int,
+    search_limit: int,
+) -> list[int]:
+    vector_ids = [
+        row[0]
+        for row in search_vector_candidates(
+            embedding,
+            limit=search_limit,
+        )
+    ]
+    keyword_ids = [
+        row[0]
+        for row, _score in search_bm25_candidates(
+            text,
+            limit=search_limit,
+        )
+    ]
+    return reciprocal_rank_fusion(
+        [vector_ids, keyword_ids],
+        limit=limit,
+    )
+
+
 def find_query_anchors(
     query: str,
     embedding: list[float],
     limit: int = 10,
     search_limit: int = 30,
 ):
-    vector_rows = search_vector_candidates(
-        embedding,
-        limit=search_limit,
-    )
-    keyword_matches = search_bm25_candidates(
+    anchor_ids = _find_hybrid_candidate_ids(
         query,
-        limit=search_limit,
-    )
-
-    vector_ids = [row[0] for row in vector_rows]
-    keyword_ids = [
-        row[0]
-        for row, _score in keyword_matches
-    ]
-    anchor_ids = reciprocal_rank_fusion(
-        [vector_ids, keyword_ids],
+        embedding,
         limit=limit,
+        search_limit=search_limit,
     )
 
     if not anchor_ids:

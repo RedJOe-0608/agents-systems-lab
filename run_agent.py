@@ -79,12 +79,11 @@ def main():
                     print(f"\nFinding candidates for: {candidate['text']}")
                     write_candidates = find_write_candidates(
                         candidate["text"],
-                        candidate["entities"],
                         embedding,
                     )
 
-                    for existing, score in write_candidates:
-                        print(f"  Candidate {existing[0]} ({score:.3f}): {existing[1]}")
+                    for rank, existing in enumerate(write_candidates, start=1):
+                        print(f"  Candidate {rank} (memory {existing[0]}): {existing[1]}")
 
                     memory_id = save_memory(
                         candidate["text"],
